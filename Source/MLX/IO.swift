@@ -2,6 +2,7 @@
 
 import Cmlx
 import Foundation
+import CryptoKit
 
 public enum LoadSaveError: Error {
     case unableToOpen(URL, String)
