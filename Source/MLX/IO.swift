@@ -2,6 +2,7 @@
 
 import Cmlx
 import Foundation
+import CryptoKit
 
 public enum LoadSaveError: Error {
     case unableToOpen(URL, String)
@@ -58,12 +59,99 @@ public func save(array: MLXArray, url: URL, stream: StreamOrDevice = .default) t
 /// - ``save(arrays:metadata:url:stream:)``
 /// - ``loadArray(url:stream:)``
 /// - ``loadArrays(url:stream:)``
-public func save(
+public struct SaveReceipt: Sendable, Equatable {
+    public let sha256: String
+    public let bytesWritten: Int64
+
+    public init(sha256: String, bytesWritten: Int64) {
+        self.sha256 = sha256
+        self.bytesWritten = bytesWritten
+    }
+}
+
+private final class FileDigestWriterState {
+    let handle: FileHandle
+    var offset: Int64 = 0
+    var writeError: Error?
+    var hasher = SHA256()
+
+    init(url: URL) throws {
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        handle = try FileHandle(forWritingTo: url)
+        try handle.truncate(atOffset: 0)
+    }
+
+    func receipt() throws -> SaveReceipt {
+        if let writeError { throw writeError }
+        let finalOffset = try handle.seekToEnd()
+        let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        return SaveReceipt(sha256: digest, bytesWritten: Int64(finalOffset))
+    }
+
+    func close() {
+        handle.closeFile()
+    }
+}
+
+private let fileDigestWriterLabel: StaticString = "<safetensors digest writer>\0"
+
+private func new_mlx_io_writer_fileDigest(_ state: FileDigestWriterState) -> mlx_io_writer {
+    let ptr = Unmanaged.passRetained(state).toOpaque()
+    return mlx_io_writer_new(ptr, mlx_io_vtable { ptr in
+        ptr != nil
+    } good: { ptr in
+        true
+    } tell: { ptr in
+        let state = Unmanaged<FileDigestWriterState>.fromOpaque(ptr!).takeUnretainedValue()
+        return state.offset
+    } seek: { ptr, offset, whence in
+        let state = Unmanaged<FileDigestWriterState>.fromOpaque(ptr!).takeUnretainedValue()
+        switch whence {
+        case SEEK_SET:
+            state.offset = Int64(offset)
+            try? state.handle.seek(toOffset: UInt64(max(0, state.offset)))
+        case SEEK_CUR:
+            state.offset += Int64(offset)
+            try? state.handle.seek(toOffset: UInt64(max(0, state.offset)))
+        case SEEK_END:
+            if let end = try? state.handle.seekToEnd() {
+                state.offset = Int64(end) + Int64(offset)
+                try? state.handle.seek(toOffset: UInt64(max(0, state.offset)))
+            }
+        default:
+            break
+        }
+    } read: { _, _, _ in
+        // The safetensors writer is write-only.
+    } read_at_offset: { _, _, _, _ in
+        // The safetensors writer is write-only.
+    } write: { ptr, data, n in
+        let state = Unmanaged<FileDigestWriterState>.fromOpaque(ptr!).takeUnretainedValue()
+        guard n > 0 else { return }
+        let buffer = UnsafeRawBufferPointer(start: data, count: n)
+        do {
+            try state.handle.write(contentsOf: Data(buffer))
+            state.hasher.update(buffer: buffer)
+            state.offset += Int64(n)
+        } catch {
+            state.writeError = error
+        }
+    } label: { _ in
+        UnsafeRawPointer(fileDigestWriterLabel.utf8Start).assumingMemoryBound(to: Int8.self)
+    } free: { ptr in
+        let state = Unmanaged<FileDigestWriterState>.fromOpaque(ptr!).takeRetainedValue()
+        state.close()
+    })
+}
+
+/// Save dictionary of arrays in safetensors format and return the SHA-256
+/// of the exact bytes emitted by the safetensors writer. The digest is updated
+/// on each writer callback, so the saved file is not read a second time.
+public func saveWithReceipt(
     arrays: [String: MLXArray], metadata: [String: String] = [:], url: URL,
     stream: StreamOrDevice = .default
-) throws {
+) throws -> SaveReceipt {
     precondition(url.isFileURL)
-    let path = url.path(percentEncoded: false)
 
     let mlx_arrays = new_mlx_array_map(arrays)
     defer { mlx_map_string_to_array_free(mlx_arrays) }
@@ -71,17 +159,32 @@ public func save(
     let mlx_metadata = new_mlx_string_map(metadata)
     defer { mlx_map_string_to_string_free(mlx_metadata) }
 
-    switch url.pathExtension {
-    case "safetensors":
-        _ = try withError {
-            _ = withEvalLock {
-                mlx_save_safetensors(path.cString(using: .utf8), mlx_arrays, mlx_metadata)
-            }
-        }
-
-    default:
+    guard url.pathExtension == "safetensors" else {
         throw LoadSaveError.unknownExtension(url.pathExtension)
     }
+
+    let state = try FileDigestWriterState(url: url)
+    let writer = new_mlx_io_writer_fileDigest(state)
+    defer { mlx_io_writer_free(writer) }
+
+    _ = try withError {
+        _ = withEvalLock {
+            mlx_save_safetensors_writer(writer, mlx_arrays, mlx_metadata)
+        }
+    }
+
+    return try state.receipt()
+}
+
+/// Save dictionary of arrays in safetensors format.
+///
+/// This compatibility API preserves the existing no-result signature; callers
+/// that need the write-time digest should use saveWithReceipt.
+public func save(
+    arrays: [String: MLXArray], metadata: [String: String] = [:], url: URL,
+    stream: StreamOrDevice = .default
+) throws {
+    _ = try saveWithReceipt(arrays: arrays, metadata: metadata, url: url, stream: stream)
 }
 
 /// Load array from a binary file in `.npy` format.
