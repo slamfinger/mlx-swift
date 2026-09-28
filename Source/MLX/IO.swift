@@ -103,7 +103,7 @@ private func new_mlx_io_writer_fileDigest(_ state: FileDigestWriterState) -> mlx
         true
     } tell: { ptr in
         let state = Unmanaged<FileDigestWriterState>.fromOpaque(ptr!).takeUnretainedValue()
-        return state.offset
+        return Int(state.offset)
     } seek: { ptr, offset, whence in
         let state = Unmanaged<FileDigestWriterState>.fromOpaque(ptr!).takeUnretainedValue()
         switch whence {
@@ -129,9 +129,10 @@ private func new_mlx_io_writer_fileDigest(_ state: FileDigestWriterState) -> mlx
         let state = Unmanaged<FileDigestWriterState>.fromOpaque(ptr!).takeUnretainedValue()
         guard n > 0 else { return }
         let buffer = UnsafeRawBufferPointer(start: data, count: n)
+        let bytes = Data(buffer)
         do {
-            try state.handle.write(contentsOf: Data(buffer))
-            state.hasher.update(buffer: buffer)
+            try state.handle.write(contentsOf: bytes)
+            state.hasher.update(data: bytes)
             state.offset += Int64(n)
         } catch {
             state.writeError = error
