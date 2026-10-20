@@ -217,6 +217,12 @@ size_t mlx_array_nbytes(const mlx_array arr);
  * The array's dimension.
  */
 size_t mlx_array_ndim(const mlx_array arr);
+typedef struct mlx_array_storage_identity {
+  uintptr_t data_descriptor;
+  uintptr_t buffer;
+  bool holds_data;
+} mlx_array_storage_identity;
+mlx_array_storage_identity mlx_array_get_storage_identity(const mlx_array arr);
 /**
  * The shape of the array.
  * Returns: a pointer to the sizes of each dimension.
